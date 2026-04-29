@@ -1,7 +1,8 @@
 Demonstrate running "dune exec" concurrently with an eager rpc server.
 
-  $ echo '(lang dune 3.18)' > dune-project
-  $ echo '(executable (name foo))' > dune
+  $ echo '(lang dune 3.18)
+  > (package (name foo))' > dune-project
+  $ echo '(executable (name foo) (public_name foo))' > dune
   $ echo 'let () = print_endline "foo"' > foo.ml
   $ touch README.md
 
@@ -10,6 +11,9 @@ testing the --no-build option:
   $ dune build README.md --watch &
   Success, waiting for filesystem changes...
   Success, waiting for filesystem changes...
+  Success, waiting for filesystem changes...
+  Error: Don't know how to build _build/install/default/bin/echo
+  Had 1 error, waiting for filesystem changes...
 
 Make sure the RPC server is properly started:
   $ dune rpc ping --wait
@@ -25,11 +29,12 @@ Demonstrate running an executable from the current project:
   $ dune exec ./foo.exe
   foo
 
+Demonstrate running a named executable from the current project:
+  $ dune exec foo
+  foo
+
 Demonstrate running an executable from PATH:
   $ dune exec echo "bar"
-  Warning: As this is not the main instance of Dune it is unable to locate the
-  executable "echo" within this project. Dune will attempt to resolve the
-  executable's name within your PATH only.
   bar
 
 Demonstrate trying to run exec in watch mode while another watch server is running:
