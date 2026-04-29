@@ -317,6 +317,40 @@ let handler (t : _ t Fdecl.t) : 'build_arg Handler.t =
       Build targets)
   in
   let () =
+    let f _ ({ Decl.Resolve_program.Request.context; source_dir; program } : _) =
+      Memo.run
+      @@
+      let open Memo.O in
+      let context = Dune_engine.Context_name.of_string context in
+      let dir =
+        Path.Build.append_source
+          (Dune_engine.Context_name.build_dir context)
+          (Path.Source.of_string source_dir)
+      in
+      let* sctx = Dune_rules.Super_context.find_exn context in
+      let* resolved =
+        Dune_rules.Super_context.resolve_program_memo sctx ~dir ~loc:None program
+      in
+      Memo.return
+      @@
+      match resolved with
+      | Error (_ : Dune_engine.Action.Prog.Not_found.t) ->
+        Decl.Resolve_program.Response.Not_found
+      | Ok path ->
+        (match Path.as_in_build_dir path with
+         | Some path ->
+           let target = Path.Build.to_string path in
+           let path = Path.to_absolute_filename (Path.build path) in
+           Decl.Resolve_program.Response.Found
+             (Decl.Resolve_program.Response.Resolution.In_build_dir { target; path })
+         | None ->
+           Decl.Resolve_program.Response.Found
+             (Decl.Resolve_program.Response.Resolution.External
+                (Path.to_absolute_filename path)))
+    in
+    Handler.implement_request rpc Decl.resolve_program f
+  in
+  let () =
     implement_request_pending_action Procedures.Public.runtest ~f:(fun paths ->
       Runtest paths)
   in
