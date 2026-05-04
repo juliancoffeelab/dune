@@ -62,7 +62,10 @@ end = struct
 
   module Commands = struct
     type t =
-      | File of string
+      | File of
+          { path : string
+          ; context : string option
+          }
       | Halt
       | Unknown of string
 
@@ -73,7 +76,9 @@ end = struct
         let open Sexp in
         (match sexp with
          | Atom "Halt" -> Halt
-         | List [ Atom "File"; Atom path ] -> File path
+         | List [ Atom "File"; Atom path ] -> File { path; context = None }
+         | List [ Atom "File"; Atom path; Atom "Context"; Atom context ] ->
+           File { path; context = Some context }
          | sexp ->
            let msg = Printf.sprintf "Bad input: %s" (Sexp.to_string sexp) in
            Unknown msg)
@@ -113,32 +118,47 @@ end = struct
 
   module Merlin = Dune_rules.Merlin
 
+  let no_config_found file =
+    Path.Build.drop_build_context_exn file
+    |> Path.Source.to_string_maybe_quoted
+    |> Printf.sprintf "No config found for file %s. Try calling 'dune build'."
+    |> Merlin_conf.make_error
+  ;;
+
+  let rec find_closest_config_for path ~file =
+    match
+      get_merlin_files_paths path
+      |> List.find_map ~f:(fun file_path ->
+        (* FIXME we are racing against the build system writing these
+           files here *)
+        match Merlin.Processed.load_file file_path with
+        | Error msg -> Some (Error (Merlin_conf.make_error msg))
+        | Ok config ->
+          (match Merlin.Processed.get config ~file with
+           | Some config -> Some (Ok config)
+           | None -> None))
+    with
+    | Some x -> Some x
+    | None ->
+      (match Path.Build.parent path with
+       | None -> None
+       | Some dir -> find_closest_config_for dir ~file)
+  ;;
+
   let load_merlin_file file =
     (* We search for an appropriate merlin configuration in the current
        directory and its parents *)
-    let rec find_closest path =
-      match
-        get_merlin_files_paths path
-        |> List.find_map ~f:(fun file_path ->
-          (* FIXME we are racing against the build system writing these
-             files here *)
-          match Merlin.Processed.load_file file_path with
-          | Error msg -> Some (Merlin_conf.make_error msg)
-          | Ok config -> Merlin.Processed.get config ~file)
-      with
-      | Some p -> Some p
-      | None ->
-        (match Path.Build.parent path with
-         | None -> None
-         | Some dir -> find_closest dir)
-    in
-    match find_closest (Path.Build.parent_exn file) with
-    | Some x -> x
-    | None ->
-      Path.Build.drop_build_context_exn file
-      |> Path.Source.to_string_maybe_quoted
-      |> Printf.sprintf "No config found for file %s. Try calling 'dune build'."
-      |> Merlin_conf.make_error
+    match find_closest_config_for (Path.Build.parent_exn file) ~file with
+    | Some (Error error) -> error
+    | Some (Ok config) -> config
+    | None -> no_config_found file
+  ;;
+
+  let load_merlin_file_with_context ~target:_ ~context =
+    match find_closest_config_for (Path.Build.parent_exn context) ~file:context with
+    | Some (Error error) -> error
+    | Some (Ok config) -> config
+    | None -> no_config_found context
   ;;
 
   (* [to_local p] makes path [p] relative to the project's root. [p] can be: -
@@ -183,12 +203,21 @@ end = struct
             Ok (Path.Build.append_local (Context_name.build_dir context) file)))
   ;;
 
-  let print_merlin_conf ~selected_context file =
-    to_local ~selected_context file
-    >>| (function
-     | Error s -> Merlin_conf.make_error s
-     | Ok file -> load_merlin_file file)
-    >>| Merlin_conf.to_stdout
+  let print_merlin_conf ~selected_context ~path ~context =
+    let+ config =
+      to_local ~selected_context path
+      >>= function
+      | Ok file -> Fiber.return (load_merlin_file file)
+      | Error error ->
+        (match context with
+         | None -> Fiber.return (Merlin_conf.make_error error)
+         | Some context ->
+           to_local ~selected_context context
+           >>| (function
+            | Error _ -> Merlin_conf.make_error error
+            | Ok context -> load_merlin_file_with_context ~target:path ~context))
+    in
+    Merlin_conf.to_stdout config
   ;;
 
   let dump ~selected_context ~format s =
@@ -212,8 +241,8 @@ end = struct
     let rec main () =
       match Commands.read_input stdin with
       | Halt -> Fiber.return ()
-      | File path ->
-        let* () = print_merlin_conf ~selected_context path in
+      | File { path; context } ->
+        let* () = print_merlin_conf ~selected_context ~path ~context in
         main ()
       | Unknown msg ->
         Merlin_conf.to_stdout (Merlin_conf.make_error msg);
