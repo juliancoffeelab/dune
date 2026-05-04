@@ -199,6 +199,8 @@ let get_path ctx_name =
   Option.map source_path ~f:lock_dir_of_source
 ;;
 
+let get_source_path = get_source_path_for_context
+
 let get_workspace_lock_dir ctx =
   let* workspace = Workspace.workspace () in
   let+ path = get_path ctx in

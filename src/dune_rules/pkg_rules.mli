@@ -38,6 +38,13 @@ val resolve_installed_file
 val dev_tool_env : Dune_pkg.Dev_tool.t -> Env.t Memo.t
 val all_filtered_depexts : Context_name.t -> string list Memo.t
 
+val source_path_of_external_dependency
+  :  Context_name.t
+  -> Path.External.t
+  -> Path.Build.t option Memo.t
+
+val external_src_dir_of_installed_lib : Context_name.t -> Path.t -> Path.t option Memo.t
+
 val setup_pkg_install_alias
   :  dir:Path.Build.t
   -> Context_name.t

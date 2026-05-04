@@ -45,6 +45,12 @@ module Processed : sig
   val print_generic_dot_merlin : Path.t list -> unit
 
   val get : t -> file:Path.Build.t -> Sexp.t option
+
+  val get_external_package
+    :  base:t option
+    -> Dune_package.t
+    -> file:Path.Build.t
+    -> Sexp.t option
 end
 
 val make
