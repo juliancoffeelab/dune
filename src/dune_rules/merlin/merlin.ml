@@ -378,6 +378,67 @@ module Processed = struct
     to_sexp ~unit_name ~opens ~pp ~reader config
   ;;
 
+  let of_external_lib ?base (lib : Dune_package.Lib.t) =
+    let info = Dune_package.Lib.info lib in
+    match Lib_info.modules info ~for_:Ocaml with
+    | External None | Local -> None
+    | External (Some modules) ->
+      let src_dir = Lib_info.best_src_dir info in
+      let obj_dir = Obj_dir.dir (Lib_info.obj_dir info) in
+      let config =
+        match base with
+        | None ->
+          { stdlib_dir = None
+          ; source_root = Path.Source.root |> Path.source
+          ; obj_dirs = Path.Set.singleton obj_dir
+          ; src_dirs = Path.Set.singleton src_dir
+          ; hidden_obj_dirs = Path.Set.empty
+          ; hidden_src_dirs = Path.Set.empty
+          ; flags = []
+          ; extensions = []
+          ; indexes = []
+          ; parameters = []
+          }
+        | Some { config; _ } ->
+          { config with
+            obj_dirs = Path.Set.add config.obj_dirs obj_dir
+          ; src_dirs = Path.Set.add config.src_dirs src_dir
+          }
+      in
+      let per_file_config =
+        modules
+        |> Modules.With_vlib.drop_vlib
+        |> Modules.fold ~init:[] ~f:(fun m init ->
+          Module.sources_without_pp m
+          |> Path.Build.Set.of_list_map ~f:Path.as_in_build_dir_exn
+          |> Path.Build.Set.fold ~init ~f:(fun src acc ->
+            let config =
+              { module_ = Module.set_pp m None
+              ; opens = Modules.With_vlib.local_open modules m
+              ; reader = None
+              }
+            in
+            let src_without_extension = remove_extension src in
+            (src, config) :: (src_without_extension, config) :: acc))
+        |> Path.Build.Map.of_list_reduce ~f:(fun existing _ -> existing)
+      in
+      Some { config; per_file_config; pp_config = Module_name.Per_item.for_all None }
+  ;;
+
+  let get_external_package ~base (package : Dune_package.t) ~file =
+    Lib_name.Map.values package.entries
+    |> List.find_map ~f:(function
+      | Dune_package.Entry.Deprecated_library_name _ -> None
+      | Library lib | Hidden_library lib ->
+        let info = Dune_package.Lib.info lib in
+        let src_dir = Lib_info.best_src_dir info in
+        if Option.is_none (Path.drop_prefix (Path.build file) ~prefix:src_dir)
+        then None
+        else
+          Option.bind (of_external_lib ?base lib) ~f:(fun processed ->
+            get processed ~file))
+  ;;
+
   let dump_entries { per_file_config; pp_config; config } : Dump_entry.t list =
     Path.Build.Map.to_list per_file_config
     |> List.map ~f:(fun (source_path, { module_; opens; reader }) ->
@@ -660,7 +721,13 @@ module Unprocessed = struct
 
   let src_dirs sctx lib ~for_ =
     match Lib.Local.of_lib lib with
-    | None -> Lib.info lib |> Lib_info.src_dir |> Path.Set.singleton |> Memo.return
+    | None ->
+      let context = Super_context.context sctx in
+      let src_dir = Lib.info lib |> Lib_info.src_dir in
+      Pkg_rules.external_src_dir_of_installed_lib (Context.name context) src_dir
+      >>| (function
+       | Some src_dir -> Path.Set.singleton src_dir
+       | None -> Path.Set.singleton src_dir)
     | Some lib ->
       Dir_contents.modules_of_local_lib sctx lib ~for_
       >>| Modules.source_dirs
