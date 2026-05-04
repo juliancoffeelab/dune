@@ -2329,6 +2329,12 @@ let build_rule context_name ~source_deps (pkg : Pkg.t) =
     |> List.concat
     |> Action_builder.progn
   in
+  let directory_targets =
+    let targets = [ pkg.write_paths.target_dir ] in
+    match pkg.build_command with
+    | Some Dune -> Path.Build.relative pkg.write_paths.source_dir "_build" :: targets
+    | Some (Action _) | None -> targets
+  in
   let open Action_builder.With_targets.O in
   (let deps =
      let deps = Dep.Set.union source_deps (Pkg.package_deps pkg) in
@@ -2339,8 +2345,7 @@ let build_rule context_name ~source_deps (pkg : Pkg.t) =
    Action_builder.deps deps |> Action_builder.with_no_targets)
   (* TODO should we add env deps on these? *)
   >>> add_env (Pkg.exported_env pkg) build_action
-  |> Action_builder.With_targets.add_directories
-       ~directory_targets:[ pkg.write_paths.target_dir ]
+  |> Action_builder.With_targets.add_directories ~directory_targets
 ;;
 
 let gen_rules context_name (pkg : Pkg.t) =
