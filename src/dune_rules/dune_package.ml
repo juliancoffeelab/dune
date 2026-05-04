@@ -58,6 +58,22 @@ module Lib = struct
     Path.Local.L.relative Path.Local.root components
   ;;
 
+  let synthetic_source_dir base =
+    let base = Path.Expert.try_localize_external base in
+    match Path.extract_build_context base with
+    | None -> None
+    | Some (context, source_path) ->
+      (match Path.Source.explode source_path with
+       | pkg_context :: ".pkg" :: pkg_digest :: "target" :: "lib" :: _ ->
+         let context = Context_name.of_string context in
+         Some
+           (Path.build
+              (Path.Build.L.relative
+                 (Context_name.build_dir context)
+                 [ pkg_context; ".pkg"; pkg_digest; "source" ]))
+       | _ -> None)
+  ;;
+
   let encode ~package_root ~stublibs { info; main_module_name; external_location = _ } =
     let open Dune_lang.Encoder in
     let no_loc f (_loc, x) = f x in
@@ -191,6 +207,7 @@ module Lib = struct
 
   let decode ~(lang : Vfile.Lang.Instance.t) ~base =
     let open Dune_lang.Decoder in
+    let source_base = Option.value (synthetic_source_dir base) ~default:base in
     let path = Dune_lang.Path.Local.decode ~dir:base in
     let field_l s x = field ~default:[] s (repeat x) in
     let libs s = field_l s (located Lib_name.decode) in
@@ -257,7 +274,7 @@ module Lib = struct
        and+ ppx_runtime_deps = libs "ppx_runtime_deps"
        and+ sub_systems = Sub_system_info.record_parser
        and+ orig_src_dir = field_o "orig_src_dir" path
-       and+ modules = field "modules" (Modules.decode ~src_dir:base)
+       and+ modules = field "modules" (Modules.decode ~src_dir:source_base)
        and+ special_builtin_support =
          field_o
            "special_builtin_support"
@@ -268,7 +285,7 @@ module Lib = struct
        in
        let modes = Lib_mode.Map.Set.of_list modes in
        let info : Path.t Lib_info.t =
-         let src_dir = Obj_dir.dir obj_dir in
+         let src_dir = source_base in
          let lib_id = Lib_id.External (loc, name) in
          let enabled = Memo.return Lib_info.Enabled_status.Normal in
          let status =

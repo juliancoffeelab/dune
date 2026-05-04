@@ -100,7 +100,7 @@ end = struct
      navigates to the [_build] directory and reaches this path from the correct
      context. Then it returns the list of available Merlin configurations for
      this directory. *)
-  let get_merlin_files_paths dir =
+  let get_merlin_files_paths_in_dir dir =
     let merlin_path =
       Path.Build.relative dir Dune_rules.Merlin_ident.merlin_folder_name
     in
@@ -111,7 +111,81 @@ end = struct
     |> List.map ~f:(fun f -> Path.Build.relative merlin_path f |> Path.build)
   ;;
 
+  let get_pkg_inner_merlin_files_paths dir =
+    match Path.Build.extract_build_context dir with
+    | None -> []
+    | Some (context, source_dir) ->
+      (match Path.Source.explode source_dir with
+       | pkg_context :: ".pkg" :: pkg_digest :: "source" :: components ->
+         let context = Context_name.of_string context in
+         let pkg_source_root =
+           Path.Build.L.relative
+             (Context_name.build_dir context)
+             [ pkg_context; ".pkg"; pkg_digest; "source" ]
+         in
+         let inner_build_dir =
+           Path.Build.relative pkg_source_root "_build/default"
+           |> fun root -> Path.Build.L.relative root components
+         in
+         get_merlin_files_paths_in_dir inner_build_dir
+       | _ -> [])
+  ;;
+
+  let get_merlin_files_paths dir =
+    List.concat
+      [ get_merlin_files_paths_in_dir dir; get_pkg_inner_merlin_files_paths dir ]
+  ;;
+
   module Merlin = Dune_rules.Merlin
+
+  let synthetic_pkg_merlin_conf file =
+    let make_directive tag value = Sexp.List [ Sexp.Atom tag; value ] in
+    let make_directive_of_path tag path =
+      make_directive tag (Sexp.Atom (Path.to_absolute_filename path))
+    in
+    let unit_name_of_file file =
+      let base =
+        Path.Build.basename file |> Filename.remove_extension |> String.capitalize_ascii
+      in
+      Sexp.Atom base
+    in
+    let first_installed_lib_dir target_lib_root =
+      match Path.readdir_unsorted target_lib_root with
+      | Error _ -> None
+      | Ok entries ->
+        List.find_map entries ~f:(fun entry ->
+          let path = Path.relative target_lib_root entry in
+          match Path.stat path with
+          | Ok { st_kind = S_DIR; _ } -> Some path
+          | Ok _ | Error _ -> None)
+    in
+    match Path.Build.extract_build_context file with
+    | None -> None
+    | Some (context, source_path) ->
+      (match Path.Source.explode source_path with
+       | pkg_context :: ".pkg" :: pkg_digest :: "source" :: _ ->
+         let context = Context_name.of_string context in
+         let pkg_root =
+           Path.Build.L.relative
+             (Context_name.build_dir context)
+             [ pkg_context; ".pkg"; pkg_digest ]
+         in
+         let source_root = Path.build (Path.Build.relative pkg_root "source") in
+         let target_lib_root = Path.build (Path.Build.relative pkg_root "target/lib") in
+         (match first_installed_lib_dir target_lib_root with
+          | None -> None
+          | Some obj_dir ->
+            Some
+              Sexp.(
+                List
+                  [ make_directive_of_path "B" obj_dir
+                  ; make_directive_of_path "S" source_root
+                  ; make_directive_of_path "SOURCE_ROOT" Path.root
+                  ; List [ Atom "EXCLUDE_QUERY_DIR" ]
+                  ; make_directive "UNIT_NAME" (unit_name_of_file file)
+                  ]))
+       | _ -> None)
+  ;;
 
   let load_merlin_file file =
     (* We search for an appropriate merlin configuration in the current
@@ -135,15 +209,18 @@ end = struct
     match find_closest (Path.Build.parent_exn file) with
     | Some x -> x
     | None ->
-      Path.Build.drop_build_context_exn file
-      |> Path.Source.to_string_maybe_quoted
-      |> Printf.sprintf "No config found for file %s. Try calling 'dune build'."
-      |> Merlin_conf.make_error
+      (match synthetic_pkg_merlin_conf file with
+       | Some conf -> conf
+       | None ->
+         Path.Build.drop_build_context_exn file
+         |> Path.Source.to_string_maybe_quoted
+         |> Printf.sprintf "No config found for file %s. Try calling 'dune build'."
+         |> Merlin_conf.make_error)
   ;;
 
-  (* [to_local p] makes path [p] relative to the project's root. [p] can be: -
-     An absolute path - A path relative to [Path.initial_cwd] *)
-  let to_local file_path =
+  (* [to_workspace_path p] resolves [p] within the current workspace. [p] can
+     be an absolute path or a path relative to [Path.initial_cwd]. *)
+  let to_workspace_path file_path =
     let error msg = Error msg in
     (* This ensure the path is absolute. If not it is prefixed with
        [Path.initial_cwd] *)
@@ -152,12 +229,7 @@ end = struct
        [Path.initial_cwd]) *)
     match make_relative_to_root abs_file_path with
     | Some path ->
-      (try
-         let path = Path.of_string path in
-         (* If dune ocaml-merlin is called from within the build dir we must
-            remove the build context *)
-         Ok (Path.drop_optional_build_context path |> Path.local_part)
-       with
+      (try Ok (Path.of_string path) with
        | User_error.E mess -> User_message.to_string mess |> error)
     | None ->
       Printf.sprintf
@@ -168,19 +240,23 @@ end = struct
   ;;
 
   let to_local ~selected_context file =
-    match to_local file with
+    match to_workspace_path file with
     | Error s -> Fiber.return (Error s)
     | Ok file ->
-      (match Dune_engine.Context_name.is_default selected_context with
-       | false ->
-         Fiber.return
-           (Ok (Path.Build.append_local (Context_name.build_dir selected_context) file))
-       | true ->
-         let+ workspace = Memo.run (Workspace.workspace ()) in
-         (match workspace.merlin_context with
-          | None -> Error "no merlin context configured"
-          | Some context ->
-            Ok (Path.Build.append_local (Context_name.build_dir context) file)))
+      if Path.is_in_build_dir file
+      then Fiber.return (Ok (Path.as_in_build_dir_exn file))
+      else (
+        let file = Path.local_part file in
+        match Dune_engine.Context_name.is_default selected_context with
+        | false ->
+          Fiber.return
+            (Ok (Path.Build.append_local (Context_name.build_dir selected_context) file))
+        | true ->
+          let+ workspace = Memo.run (Workspace.workspace ()) in
+          (match workspace.merlin_context with
+           | None -> Error "no merlin context configured"
+           | Some context ->
+             Ok (Path.Build.append_local (Context_name.build_dir context) file)))
   ;;
 
   let print_merlin_conf ~selected_context file =

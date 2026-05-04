@@ -12,6 +12,22 @@ let remove_extension file =
   Path.Build.relative dir basename
 ;;
 
+let synthetic_pkg_source_dir dir =
+  let dir = Path.Expert.try_localize_external dir in
+  match Path.extract_build_context dir with
+  | None -> None
+  | Some (context, source_path) ->
+    (match Path.Source.explode source_path with
+     | pkg_context :: ".pkg" :: pkg_digest :: "target" :: "lib" :: _ ->
+       let context = Context_name.of_string context in
+       Some
+         (Path.build
+            (Path.Build.L.relative
+               (Context_name.build_dir context)
+               [ pkg_context; ".pkg"; pkg_digest; "source" ]))
+     | _ -> None)
+;;
+
 module Processed = struct
   (* The actual content of the merlin file as built by the [Unprocessed.process]
      function from the unprocessed info gathered through [gen_rules]. The first
@@ -660,7 +676,11 @@ module Unprocessed = struct
 
   let src_dirs sctx lib ~for_ =
     match Lib.Local.of_lib lib with
-    | None -> Lib.info lib |> Lib_info.src_dir |> Path.Set.singleton |> Memo.return
+    | None ->
+      let dir = Lib.info lib |> Lib_info.src_dir in
+      Option.value (synthetic_pkg_source_dir dir) ~default:dir
+      |> Path.Set.singleton
+      |> Memo.return
     | Some lib ->
       Dir_contents.modules_of_local_lib sctx lib ~for_
       >>| Modules.source_dirs
