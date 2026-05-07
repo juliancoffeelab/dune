@@ -84,3 +84,13 @@ also remain queryable.
   > tr '(' '\n' |
   > grep -E '\?:UNIT_NAME\?:smoke_dep\)'
   ?:UNIT_NAME?:smoke_dep))
+
+The built package file inside `_build/_private/.../target/lib/...` should also
+remain queryable when an origin context is provided.
+  $ FILE=$(find $PWD/_build/_private/default/.pkg -path '*/target/lib/smoke-dep/smoke_dep.ml' -o -path '*/target/lib/smoke_dep/smoke_dep.ml' | head -n 1)
+  $ printf "(4:File%d:%s7:Context%d:%s)" ${#FILE} $FILE ${#MAIN} $MAIN \
+  > | dune ocaml-merlin \
+  > | sed -E "s/[[:digit:]]+:/?:/g" | sed "s#$PWD#\$PWD#g" |
+  > tr '(' '\n' |
+  > grep -E '\?:UNIT_NAME\?:smoke_dep\)'
+  ?:UNIT_NAME?:smoke_dep))

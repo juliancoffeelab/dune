@@ -432,7 +432,10 @@ module Processed = struct
       | Library lib | Hidden_library lib ->
         let info = Dune_package.Lib.info lib in
         let src_dir = Lib_info.best_src_dir info in
-        if Option.is_none (Path.drop_prefix (Path.build file) ~prefix:src_dir)
+        let obj_dir = Obj_dir.dir (Lib_info.obj_dir info) in
+        if
+          Option.is_none (Path.drop_prefix (Path.build file) ~prefix:src_dir)
+          && Option.is_none (Path.drop_prefix (Path.build file) ~prefix:obj_dir)
         then None
         else
           Option.bind (of_external_lib ?base lib) ~f:(fun processed ->
@@ -440,12 +443,23 @@ module Processed = struct
   ;;
 
   let rec find_source_root dir =
-    if String.equal (Path.Build.basename dir) "source"
-    then Some dir
-    else (
-      match Path.Build.parent dir with
-      | None -> None
-      | Some parent -> find_source_root parent)
+    match Path.Build.parent dir with
+    | None -> None
+    | Some parent ->
+      if String.equal (Path.Build.basename dir) "source"
+      then Some dir
+      else find_source_root parent
+  ;;
+
+  let rec find_target_root dir =
+    match Path.Build.parent dir with
+    | None -> None
+    | Some parent ->
+      (match Path.Build.parent parent with
+       | Some grandparent
+         when String.equal (Path.Build.basename parent) "lib"
+              && String.equal (Path.Build.basename grandparent) "target" -> Some dir
+       | Some _ | None -> find_target_root parent)
   ;;
 
   let rec find_physical_source_root dir =
@@ -494,6 +508,13 @@ module Processed = struct
     path_of_build_path source_root, src_dirs
   ;;
 
+  let build_target_root_and_dirs file =
+    let open Option.O in
+    let+ target_root = find_target_root (Path.Build.parent_exn file) in
+    let src_dirs = source_dirs_between ~root:target_root file in
+    path_of_build_path target_root, src_dirs
+  ;;
+
   let physical_source_root_and_dirs file =
     let open Option.O in
     let+ source_root = find_physical_source_root (Path.parent_exn file) in
@@ -507,8 +528,14 @@ module Processed = struct
       | Some physical_file ->
         (match physical_source_root_and_dirs physical_file with
          | Some _ as physical -> physical
-         | None -> build_source_root_and_dirs file)
-      | None -> build_source_root_and_dirs file
+         | None ->
+           (match build_source_root_and_dirs file with
+            | Some _ as source -> source
+            | None -> build_target_root_and_dirs file))
+      | None ->
+        (match build_source_root_and_dirs file with
+         | Some _ as source -> source
+         | None -> build_target_root_and_dirs file)
     in
     let config =
       match base with
