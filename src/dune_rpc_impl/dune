@@ -3,6 +3,7 @@
  (libraries
   dune_engine
   dune_lang
+  dune_rules
   dune_scheduler
   rpc
   dune_rpc
