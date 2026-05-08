@@ -1,0 +1,3 @@
+(library
+ (name extdep)
+ (public_name extdep))

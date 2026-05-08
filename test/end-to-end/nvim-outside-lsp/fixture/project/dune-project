@@ -1,0 +1,6 @@
+(lang dune 3.20)
+
+(package
+ (name smoke-consumer)
+ (allow_empty)
+ (depends smoke-dep))
