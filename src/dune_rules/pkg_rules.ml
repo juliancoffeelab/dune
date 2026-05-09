@@ -2649,6 +2649,101 @@ let all_filtered_depexts context =
   >>| List.sort_uniq ~compare:String.compare
 ;;
 
+let source_path_of_external_dependency context external_path =
+  let file = Path.external_ external_path in
+  let target_source_path pkg_digest suffix =
+    let paths =
+      Paths.make
+        pkg_digest
+        (Package_universe.Dependencies context)
+        ~relative:Path.Build.relative
+    in
+    let install_paths = Paths.install_paths paths in
+    let target = Path.Build.append_local (Install.Paths.get install_paths Lib) suffix in
+    if Fpath.exists (Path.to_string (Path.build target))
+    then target
+    else Path.Build.append_local paths.source_dir suffix
+  in
+  let* lock_dir_active = Lock_dir.lock_dir_active context in
+  if not lock_dir_active
+  then Memo.return None
+  else
+    let* source_lock_dir = Lock_dir.get_source_path context in
+    match source_lock_dir with
+    | None -> Memo.return None
+    | Some source_lock_dir ->
+      let* platform = Lock_dir.Sys_vars.solver_env in
+      let lock_dir = Dune_pkg.Lock_dir.read_disk_exn (Path.source source_lock_dir) in
+      let entries_by_name =
+        DB.Pkg_table.entries_by_name_of_lock_dir
+          lock_dir
+          ~platform
+          ~system_provided:DB.default_system_provided
+      in
+      Package.Name.Map.values entries_by_name
+      |> Memo.parallel_map ~f:(fun { DB.Pkg_table.pkg; pkg_digest; _ } ->
+        match pkg.info.source with
+        | None -> Memo.return None
+        | Some source ->
+          Lock_dir.source_kind source
+          >>| (function
+           | `Local (`File, _) | `Fetch -> None
+           | `Local (`Directory, source_root) ->
+             let source_root = Path.outside_build_dir source_root in
+             Option.map (Path.drop_prefix file ~prefix:source_root) ~f:(fun suffix ->
+               target_source_path pkg_digest suffix)))
+      >>| List.find_map ~f:Fun.id
+;;
+
+let external_src_dir_of_installed_lib context src_dir =
+  let pkg_prefix =
+    Path.Build.L.relative
+      Private_context.t.build_dir
+      [ Context_name.to_string context; ".pkg" ]
+    |> Path.build
+  in
+  if Option.is_none (Path.drop_prefix src_dir ~prefix:pkg_prefix)
+  then Memo.return None
+  else
+    let* lock_dir_active = Lock_dir.lock_dir_active context in
+    if not lock_dir_active
+    then Memo.return None
+    else
+      let* source_lock_dir = Lock_dir.get_source_path context in
+      match source_lock_dir with
+      | None -> Memo.return None
+      | Some source_lock_dir ->
+        let* platform = Lock_dir.Sys_vars.solver_env in
+        let lock_dir = Dune_pkg.Lock_dir.read_disk_exn (Path.source source_lock_dir) in
+        let entries_by_name =
+          DB.Pkg_table.entries_by_name_of_lock_dir
+            lock_dir
+            ~platform
+            ~system_provided:DB.default_system_provided
+        in
+        Package.Name.Map.values entries_by_name
+        |> Memo.parallel_map ~f:(fun { DB.Pkg_table.pkg; pkg_digest; _ } ->
+          match pkg.info.source with
+          | None -> Memo.return None
+          | Some source ->
+            Lock_dir.source_kind source
+            >>| (function
+             | `Local (`File, _) | `Fetch -> None
+             | `Local (`Directory, source_root) ->
+               let paths =
+                 Paths.make
+                   pkg_digest
+                   (Package_universe.Dependencies context)
+                   ~relative:Path.Build.relative
+               in
+               let install_paths = Paths.install_paths paths in
+               let lib_root = Install.Paths.get install_paths Lib |> Path.build in
+               Option.map (Path.drop_prefix src_dir ~prefix:lib_root) ~f:(fun suffix ->
+                 Path.Outside_build_dir.append_local source_root suffix
+                 |> Path.outside_build_dir)))
+        >>| List.find_map ~f:Fun.id
+;;
+
 let pkg_digest_of_project_dependency ctx package_name =
   let+ db = DB.of_ctx ctx ~allow_sharing:false in
   Pkg_digest.Map.keys db.pkg_digest_table

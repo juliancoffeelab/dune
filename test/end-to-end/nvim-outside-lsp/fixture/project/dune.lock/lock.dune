@@ -1,0 +1,4 @@
+(lang package 0.1)
+
+(repositories
+ (complete true))

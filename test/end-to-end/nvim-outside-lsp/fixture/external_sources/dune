@@ -1,0 +1,3 @@
+(library
+ (public_name smoke-dep)
+ (name smoke_dep))

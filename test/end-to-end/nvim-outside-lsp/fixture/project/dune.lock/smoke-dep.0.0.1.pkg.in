@@ -1,0 +1,7 @@
+(version 0.0.1)
+
+(source
+ (copy __SMOKE_DEP_SOURCE__))
+
+(build
+ (run dune build --release --promote-install-file=true . @install))

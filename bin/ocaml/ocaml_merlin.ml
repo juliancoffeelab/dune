@@ -62,7 +62,10 @@ end = struct
 
   module Commands = struct
     type t =
-      | File of string
+      | File of
+          { path : string
+          ; context : string option
+          }
       | Halt
       | Unknown of string
 
@@ -73,7 +76,9 @@ end = struct
         let open Sexp in
         (match sexp with
          | Atom "Halt" -> Halt
-         | List [ Atom "File"; Atom path ] -> File path
+         | List [ Atom "File"; Atom path ] -> File { path; context = None }
+         | List [ Atom "File"; Atom path; Atom "Context"; Atom context ] ->
+           File { path; context = Some context }
          | sexp ->
            let msg = Printf.sprintf "Bad input: %s" (Sexp.to_string sexp) in
            Unknown msg)
@@ -113,32 +118,84 @@ end = struct
 
   module Merlin = Dune_rules.Merlin
 
-  let load_merlin_file file =
-    (* We search for an appropriate merlin configuration in the current
-       directory and its parents *)
-    let rec find_closest path =
-      match
-        get_merlin_files_paths path
-        |> List.find_map ~f:(fun file_path ->
-          (* FIXME we are racing against the build system writing these
-             files here *)
-          match Merlin.Processed.load_file file_path with
-          | Error msg -> Some (Merlin_conf.make_error msg)
-          | Ok config -> Merlin.Processed.get config ~file)
-      with
-      | Some p -> Some p
-      | None ->
-        (match Path.Build.parent path with
-         | None -> None
-         | Some dir -> find_closest dir)
-    in
-    match find_closest (Path.Build.parent_exn file) with
-    | Some x -> x
+  let no_config_found file =
+    Path.Build.drop_build_context_exn file
+    |> Path.Source.to_string_maybe_quoted
+    |> Printf.sprintf "No config found for file %s. Try calling 'dune build'."
+    |> Merlin_conf.make_error
+  ;;
+
+  let rec find_closest_processed path =
+    match
+      get_merlin_files_paths path
+      |> List.find_map ~f:(fun file_path ->
+        match Merlin.Processed.load_file file_path with
+        | Ok config -> Some config
+        | Error _ -> None)
+    with
+    | Some config -> Some config
     | None ->
-      Path.Build.drop_build_context_exn file
-      |> Path.Source.to_string_maybe_quoted
-      |> Printf.sprintf "No config found for file %s. Try calling 'dune build'."
-      |> Merlin_conf.make_error
+      (match Path.Build.parent path with
+       | None -> None
+       | Some dir -> find_closest_processed dir)
+  ;;
+
+  let load_selected_context_merlin_config selected_context =
+    get_merlin_files_paths (Context_name.build_dir selected_context)
+    |> List.find_map ~f:(fun path ->
+      match Merlin.Processed.load_file path with
+      | Ok config -> Some config
+      | Error _ -> None)
+  ;;
+
+  let load_context_merlin_config context =
+    find_closest_processed (Path.Build.parent_exn context)
+  ;;
+
+  let find_nearest_dune_package file =
+    let rec loop dir =
+      let dune_package = Path.relative (Path.build dir) Dune_rules.Dune_package.fn in
+      if Fpath.exists (Path.to_string dune_package)
+      then Some dune_package
+      else (
+        match Path.Build.parent dir with
+        | None -> None
+        | Some dir -> loop dir)
+    in
+    loop (Path.Build.parent_exn file)
+  ;;
+
+  let load_external_package_config ~selected_context ~context file =
+    let base =
+      match context with
+      | Some context -> load_context_merlin_config context
+      | None -> load_selected_context_merlin_config selected_context
+    in
+    match find_nearest_dune_package file with
+    | None -> Fiber.return None
+    | Some dune_package_path ->
+      let package =
+        Io.with_lexbuf_from_file dune_package_path ~f:(fun lexbuf ->
+          Dune_rules.Dune_package.Or_meta.parse dune_package_path lexbuf)
+      in
+      Fiber.return
+        (match package with
+         | Error _ | Ok Dune_rules.Dune_package.Or_meta.Use_meta -> None
+         | Ok (Dune_rules.Dune_package.Or_meta.Dune_package package) ->
+           Merlin.Processed.get_external_package ~base package ~file)
+  ;;
+
+  let load_merlin_file ~selected_context ~context file =
+    match find_closest_processed (Path.Build.parent_exn file) with
+    | Some config ->
+      (match Merlin.Processed.get config ~file with
+       | Some config -> Fiber.return config
+       | None ->
+         load_external_package_config ~selected_context ~context file
+         >>| Option.value ~default:(no_config_found file))
+    | None ->
+      load_external_package_config ~selected_context ~context file
+      >>| Option.value ~default:(no_config_found file)
   ;;
 
   (* [to_local p] makes path [p] relative to the project's root. [p] can be: -
@@ -167,28 +224,63 @@ end = struct
       |> error
   ;;
 
-  let to_local ~selected_context file =
-    match to_local file with
-    | Error s -> Fiber.return (Error s)
-    | Ok file ->
-      (match Dune_engine.Context_name.is_default selected_context with
-       | false ->
-         Fiber.return
-           (Ok (Path.Build.append_local (Context_name.build_dir selected_context) file))
-       | true ->
-         let+ workspace = Memo.run (Workspace.workspace ()) in
-         (match workspace.merlin_context with
-          | None -> Error "no merlin context configured"
-          | Some context ->
-            Ok (Path.Build.append_local (Context_name.build_dir context) file)))
+  let resolve_context_name selected_context =
+    match Dune_engine.Context_name.is_default selected_context with
+    | false -> Fiber.return (Ok selected_context)
+    | true ->
+      let+ workspace = Memo.run (Workspace.workspace ()) in
+      (match workspace.merlin_context with
+       | None -> Error "no merlin context configured"
+       | Some context -> Ok context)
   ;;
 
-  let print_merlin_conf ~selected_context file =
-    to_local ~selected_context file
-    >>| (function
-     | Error s -> Merlin_conf.make_error s
-     | Ok file -> load_merlin_file file)
-    >>| Merlin_conf.to_stdout
+  let source_path_of_external_dependency context_name file =
+    match Path.of_filename_relative_to_initial_cwd file |> Path.as_outside_build_dir with
+    | Some (External external_path) ->
+      Memo.run
+        (Dune_rules.Pkg_rules.source_path_of_external_dependency
+           context_name
+           external_path)
+    | Some (In_source_dir _) | None -> Fiber.return None
+  ;;
+
+  let to_local ~selected_context file =
+    let open Fiber.O in
+    let* context_name = resolve_context_name selected_context in
+    match context_name with
+    | Error _ as error -> Fiber.return error
+    | Ok context_name ->
+      (match to_local file with
+       | Ok file ->
+         Fiber.return
+           (Ok (Path.Build.append_local (Context_name.build_dir context_name) file))
+       | Error workspace_error ->
+         let+ external_source_path =
+           source_path_of_external_dependency context_name file
+         in
+         (match external_source_path with
+          | Some path -> Ok path
+          | None -> Error workspace_error))
+  ;;
+
+  let print_merlin_conf ~selected_context ~path ~context =
+    let open Fiber.O in
+    let* context =
+      match context with
+      | None -> Fiber.return None
+      | Some context ->
+        to_local ~selected_context context
+        >>| (function
+         | Ok context -> Some context
+         | Error _ -> None)
+    in
+    let* config =
+      to_local ~selected_context path
+      >>= function
+      | Error s -> Fiber.return (Merlin_conf.make_error s)
+      | Ok file -> load_merlin_file ~selected_context ~context file
+    in
+    Fiber.return (Merlin_conf.to_stdout config)
   ;;
 
   let dump ~selected_context ~format s =
@@ -212,8 +304,8 @@ end = struct
     let rec main () =
       match Commands.read_input stdin with
       | Halt -> Fiber.return ()
-      | File path ->
-        let* () = print_merlin_conf ~selected_context path in
+      | File { path; context } ->
+        let* () = print_merlin_conf ~selected_context ~path ~context in
         main ()
       | Unknown msg ->
         Merlin_conf.to_stdout (Merlin_conf.make_error msg);
