@@ -190,33 +190,55 @@ let step ~prog ~args ~common ~no_rebuild ~context ~on_exit () =
    directory lock.
 
    Returns the absolute path to the executable. *)
-let build_prog_via_rpc_if_necessary ~dir ~no_rebuild builder lock_held_by prog =
+let build_prog_via_rpc_if_necessary ~common ~dir ~no_rebuild builder lock_held_by prog =
   match Filename.analyze_program_name prog with
   | In_path ->
-    (* This case is reached if [dune exec] is passed the name of an
-       executable (rather than a path to an executable). When dune is running
-       directly, dune will try to resolve the executbale name within the public
-       executables defined in the current project and its dependencies, and
-       only if no executable with the given name is found will dune then
-       resolve the name within the $PATH variable instead. Looking up an
-       executable's name within the current project requires running the
-       build system, but running the build system is not allowed while
-       another dune instance holds the global build directory lock. In this
-       case dune will only resolve the executable's name within $PATH.
-       Because this behaviour is different from the default, print a warning
-       so users are hopefully less surprised.
-    *)
-    User_warning.emit
-      [ Pp.textf
-          "As this is not the main instance of Dune it is unable to locate the \
-           executable %S within this project. Dune will attempt to resolve the \
-           executable's name within your PATH only."
-          prog
-      ];
-    let path = Env_path.path Env.initial in
-    (match Bin.which ~path prog with
-     | None -> not_found ~hints:[] ~prog
-     | Some prog_path -> Fiber.return (Path.to_absolute_filename prog_path))
+    let context = Common.x common |> Option.value ~default:Context_name.default in
+    let target = Path.Build.relative (Install.Context.bin_dir ~context) prog in
+    let path = Path.build target in
+    let path_string = Path.to_string path in
+    let fallback_to_path () =
+      let path = Env_path.path Env.initial in
+      match Bin.which ~path prog with
+      | None -> not_found ~hints:[] ~prog
+      | Some prog_path -> Fiber.return (Path.to_absolute_filename prog_path)
+    in
+    let target_is_missing =
+      let prefix = "Don't know how to build " in
+      function
+      | { Dune_rpc.Compound_user_error.main; severity = Error; related = _ } ->
+        String.starts_with ~prefix (User_message.to_string main)
+      | { severity = Warning; _ } -> false
+    in
+    let open Fiber.O in
+    if no_rebuild
+    then
+      if Fpath.exists path_string
+      then Fiber.return (Path.to_absolute_filename path)
+      else fallback_to_path ()
+    else (
+      let target =
+        Dune_lang.Dep_conf.File
+          (Dune_lang.String_with_vars.make_text Loc.none (Path.Build.to_string target))
+      in
+      let targets = Rpc.Rpc_common.prepare_targets [ target ] in
+      let* outcome =
+        Rpc.Rpc_common.fire_request
+          ~name:"build"
+          ~wait:false
+          ~lock_held_by
+          builder
+          Dune_rpc_impl.Decl.build
+          targets
+      in
+      match outcome with
+      | Dune_rpc.Build_outcome_with_diagnostics.Success ->
+        Fiber.return (Path.to_absolute_filename path)
+      | Failure errors when List.for_all errors ~f:target_is_missing ->
+        fallback_to_path ()
+      | Failure _ as outcome ->
+        let () = Rpc.Rpc_common.wrap_build_outcome_exn ~print_on_success:false outcome in
+        Code_error.raise "unreachable" [])
   | Relative_to_current_dir ->
     let open Fiber.O in
     let path = Path.relative_to_source_in_build_or_external ~dir prog in
@@ -268,7 +290,7 @@ let exec_building_via_rpc_server ~common ~prog ~args ~no_rebuild builder lock_he
   let prog = ensure_terminal prog in
   let args = List.map args ~f:ensure_terminal in
   let+ prog =
-    build_prog_via_rpc_if_necessary ~dir ~no_rebuild builder lock_held_by prog
+    build_prog_via_rpc_if_necessary ~common ~dir ~no_rebuild builder lock_held_by prog
   in
   Util.restore_cwd_and_execve (Common.root common) prog args Env.initial
 ;;
