@@ -240,3 +240,46 @@ Actual result:
   libraries so fallback reconstruction is needed less often.
 - If restart continuity matters, add a provenance cache with careful
   invalidation, but that is a bigger design commitment.
+
+## Follow-Up
+
+After the original PR6 experiment proved the real-path borrowed-context
+approach was viable, the follow-up branch tightened the Dune-side Merlin
+fallbacks so the feature works in the cases that still broke in real
+editor use.
+
+What changed in Dune:
+- `merlin: support external package source files`
+  taught Dune to synthesize Merlin config for external package source
+  files when there is no nearby generated Merlin file to read from
+  directly.
+- `merlin: handle external package target files`
+  extended that logic to package-managed target files under paths like
+  `_build/_private/default/.pkg/.../target/lib/.../*.ml`, which is what
+  showed up in the failing `Fmt`/stdlib follow-up cases.
+- The blackbox test
+  `test/blackbox-tests/test-cases/pkg/merlin-external-context.t`
+  was widened to cover the real package-managed source/target path
+  shapes that triggered the failures.
+
+What changed in `ocaml-lsp`:
+- The follow-up branch there added stronger borrowed-context coverage in
+  `ocaml-lsp-server/test/e2e-new/borrowed_context.ml`.
+- That test work is meant to lock in the practical editor behavior for
+  “jump into dependency code, then keep navigating there” rather than
+  only the initial goto-definition hop.
+
+What the follow-up was specifically trying to fix:
+- real external package source files still needed better fallback Merlin
+  config in some cases
+- package-managed target files could fail with “no config found”
+- stdlib navigation from inside borrowed external files still needed to
+  keep finding sibling modules like `Seq`
+
+Net result:
+- the follow-up branch is not a new design; it is the “make PR6
+  actually hold up in practice” pass
+- it keeps the same PR6 model of real editor-visible paths plus explicit
+  origin context
+- it mainly hardens the Dune fallback path so the already-chosen model
+  survives stdlib and package-target follow-up navigation
