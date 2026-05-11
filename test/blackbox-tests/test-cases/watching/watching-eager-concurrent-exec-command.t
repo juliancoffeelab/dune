@@ -1,13 +1,25 @@
 Demonstrate running "dune exec" concurrently with an eager rpc server.
 
-  $ echo '(lang dune 3.18)' > dune-project
-  $ echo '(executable (name foo))' > dune
+  $ cat > dune-project <<EOF
+  > (lang dune 3.18)
+  > (package
+  >  (name foo))
+  > EOF
+  $ echo '(executables (names foo) (public_names foo))' > dune
   $ echo 'let () = print_endline "foo"' > foo.ml
+  $ mkdir bin
+  $ cat > bin/foo <<EOF
+  > #!/bin/sh
+  > echo path-foo
+  > EOF
+  $ chmod +x bin/foo
   $ touch README.md
 
 Just watch the readme file so we don't accidentally build foo.exe before
 testing the --no-build option:
   $ dune build README.md --watch &
+  Success, waiting for filesystem changes...
+  Success, waiting for filesystem changes...
   Success, waiting for filesystem changes...
   Success, waiting for filesystem changes...
 
@@ -20,16 +32,23 @@ Demonstrate handling the --no-build option:
   Error: Program './foo.exe' isn't built yet. You need to build it first or
   remove the '--no-build' option.
   [1]
+  $ PATH="$PWD/bin:$PATH" dune exec --no-build foo
+  Error: Program 'foo' isn't built yet. You need to build it first or remove
+  the '--no-build' option.
+  [1]
 
 Demonstrate running an executable from the current project:
   $ dune exec ./foo.exe
   foo
 
+Demonstrate resolving a named executable from the current project:
+  $ dune exec foo
+  foo
+  $ PATH="$PWD/bin:$PATH" dune exec foo
+  foo
+
 Demonstrate running an executable from PATH:
   $ dune exec echo "bar"
-  Warning: As this is not the main instance of Dune it is unable to locate the
-  executable "echo" within this project. Dune will attempt to resolve the
-  executable's name within your PATH only.
   bar
 
 Demonstrate trying to run exec in watch mode while another watch server is running:

@@ -193,30 +193,56 @@ let step ~prog ~args ~common ~no_rebuild ~context ~on_exit () =
 let build_prog_via_rpc_if_necessary ~dir ~no_rebuild builder lock_held_by prog =
   match Filename.analyze_program_name prog with
   | In_path ->
-    (* This case is reached if [dune exec] is passed the name of an
-       executable (rather than a path to an executable). When dune is running
-       directly, dune will try to resolve the executbale name within the public
-       executables defined in the current project and its dependencies, and
-       only if no executable with the given name is found will dune then
-       resolve the name within the $PATH variable instead. Looking up an
-       executable's name within the current project requires running the
-       build system, but running the build system is not allowed while
-       another dune instance holds the global build directory lock. In this
-       case dune will only resolve the executable's name within $PATH.
-       Because this behaviour is different from the default, print a warning
-       so users are hopefully less surprised.
-    *)
-    User_warning.emit
-      [ Pp.textf
-          "As this is not the main instance of Dune it is unable to locate the \
-           executable %S within this project. Dune will attempt to resolve the \
-           executable's name within your PATH only."
-          prog
-      ];
-    let path = Env_path.path Env.initial in
-    (match Bin.which ~path prog with
-     | None -> not_found ~hints:[] ~prog
-     | Some prog_path -> Fiber.return (Path.to_absolute_filename prog_path))
+    let open Fiber.O in
+    let context, source_dir =
+      match Path.Build.extract_build_context_dir dir with
+      | Some (context, source_dir) ->
+        Path.Build.basename context, Path.Source.to_string source_dir
+      | None ->
+        Code_error.raise
+          "dune exec RPC resolver expects a context-relative directory"
+          [ "dir", Path.Build.to_dyn dir ]
+    in
+    let request =
+      Dune_rpc_impl.Decl.Resolve_program.Request.{ context; source_dir; program = prog }
+    in
+    let* response =
+      Rpc.Rpc_common.fire_request
+        ~name:"resolve-program"
+        ~wait:false
+        ~lock_held_by
+        builder
+        Dune_rpc_impl.Decl.resolve_program
+        request
+    in
+    (match response with
+     | Dune_rpc_impl.Decl.Resolve_program.Response.Not_found -> not_found ~hints:[] ~prog
+     | Dune_rpc_impl.Decl.Resolve_program.Response.Found
+         (Dune_rpc_impl.Decl.Resolve_program.Response.Resolution.External path) ->
+       Fiber.return path
+     | Dune_rpc_impl.Decl.Resolve_program.Response.Found
+         (Dune_rpc_impl.Decl.Resolve_program.Response.Resolution.In_build_dir
+            { target; path }) ->
+       let+ () =
+         if no_rebuild
+         then if Fpath.exists path then Fiber.return () else program_not_built_yet prog
+         else (
+           let target =
+             Dune_lang.Dep_conf.File
+               (Dune_lang.String_with_vars.make_text Loc.none target)
+           in
+           let targets = Rpc.Rpc_common.prepare_targets [ target ] in
+           let open Fiber.O in
+           Rpc.Rpc_common.fire_request
+             ~name:"build"
+             ~wait:false
+             ~lock_held_by
+             builder
+             Dune_rpc_impl.Decl.build
+             targets
+           >>| Rpc.Rpc_common.wrap_build_outcome_exn ~print_on_success:false)
+       in
+       path)
   | Relative_to_current_dir ->
     let open Fiber.O in
     let path = Path.relative_to_source_in_build_or_external ~dir prog in
