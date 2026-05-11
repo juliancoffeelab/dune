@@ -432,11 +432,154 @@ module Processed = struct
       | Library lib | Hidden_library lib ->
         let info = Dune_package.Lib.info lib in
         let src_dir = Lib_info.best_src_dir info in
-        if Option.is_none (Path.drop_prefix (Path.build file) ~prefix:src_dir)
+        let obj_dir = Obj_dir.dir (Lib_info.obj_dir info) in
+        if
+          Option.is_none (Path.drop_prefix (Path.build file) ~prefix:src_dir)
+          && Option.is_none (Path.drop_prefix (Path.build file) ~prefix:obj_dir)
         then None
         else
           Option.bind (of_external_lib ?base lib) ~f:(fun processed ->
             get processed ~file))
+  ;;
+
+  let rec find_source_root dir =
+    match Path.Build.parent dir with
+    | None -> None
+    | Some parent ->
+      if String.equal (Path.Build.basename dir) "source"
+      then Some dir
+      else find_source_root parent
+  ;;
+
+  let rec find_target_root dir =
+    match Path.Build.parent dir with
+    | None -> None
+    | Some parent ->
+      (match Path.Build.parent parent with
+       | Some grandparent
+         when String.equal (Path.Build.basename parent) "lib"
+              && String.equal (Path.Build.basename grandparent) "target" -> Some dir
+       | Some _ | None -> find_target_root parent)
+  ;;
+
+  let rec find_physical_source_root dir =
+    if String.equal (Path.basename dir) "source"
+    then Some dir
+    else (
+      match Path.parent dir with
+      | None -> None
+      | Some parent -> find_physical_source_root parent)
+  ;;
+
+  let path_of_build_path path =
+    Path.Build.to_string path |> Path.of_filename_relative_to_initial_cwd
+  ;;
+
+  let source_dirs_between ~root file =
+    let rec loop acc dir =
+      let acc = Path.Set.add acc (path_of_build_path dir) in
+      if Path.Build.equal dir root
+      then acc
+      else (
+        match Path.Build.parent dir with
+        | None -> acc
+        | Some parent -> loop acc parent)
+    in
+    loop Path.Set.empty (Path.Build.parent_exn file)
+  ;;
+
+  let physical_source_dirs_between ~root file =
+    let rec loop acc dir =
+      let acc = Path.Set.add acc dir in
+      if Path.equal dir root
+      then acc
+      else (
+        match Path.parent dir with
+        | None -> acc
+        | Some parent -> loop acc parent)
+    in
+    loop Path.Set.empty (Path.parent_exn file)
+  ;;
+
+  let build_source_root_and_dirs file =
+    let open Option.O in
+    let+ source_root = find_source_root (Path.Build.parent_exn file) in
+    let src_dirs = source_dirs_between ~root:source_root file in
+    path_of_build_path source_root, src_dirs
+  ;;
+
+  let build_target_root_and_dirs file =
+    let open Option.O in
+    let+ target_root = find_target_root (Path.Build.parent_exn file) in
+    let src_dirs = source_dirs_between ~root:target_root file in
+    path_of_build_path target_root, src_dirs
+  ;;
+
+  let physical_source_root_and_dirs file =
+    let open Option.O in
+    let+ source_root = find_physical_source_root (Path.parent_exn file) in
+    source_root, physical_source_dirs_between ~root:source_root file
+  ;;
+
+  let get_external_source_fallback ~base ~file ~physical_file =
+    let open Option.O in
+    let* source_root, src_dirs =
+      match physical_file with
+      | Some physical_file ->
+        (match physical_source_root_and_dirs physical_file with
+         | Some _ as physical -> physical
+         | None ->
+           (match build_source_root_and_dirs file with
+            | Some _ as source -> source
+            | None -> build_target_root_and_dirs file))
+      | None ->
+        (match build_source_root_and_dirs file with
+         | Some _ as source -> source
+         | None -> build_target_root_and_dirs file)
+    in
+    let config =
+      match base with
+      | None ->
+        { stdlib_dir = None
+        ; source_root
+        ; obj_dirs = Path.Set.empty
+        ; src_dirs
+        ; hidden_obj_dirs = Path.Set.empty
+        ; hidden_src_dirs = Path.Set.empty
+        ; flags = []
+        ; extensions = []
+        ; indexes = []
+        ; parameters = []
+        }
+      | Some { config; _ } ->
+        { config with source_root; src_dirs = Path.Set.union config.src_dirs src_dirs }
+    in
+    let basename = Path.Build.basename file in
+    let module_basename =
+      match String.rsplit2 basename ~on:'.' with
+      | Some (module_basename, _) -> module_basename
+      | None -> basename
+    in
+    let module_name =
+      Module_name.of_string_allow_invalid (Loc.none, module_basename)
+      |> Module_name.Unchecked.allow_invalid
+    in
+    let path = Nonempty_list.[ module_name ] in
+    let kind, impl, intf =
+      let source_file = Module.File.make Dialect.ocaml (Path.build file) in
+      if Filename.check_suffix basename ".mli" || Filename.check_suffix basename ".rei"
+      then Module.Kind.Intf_only, None, Some source_file
+      else Module.Kind.Impl, Some source_file, None
+    in
+    let source = Module.Source.make ~impl ~intf path in
+    let module_ = Module.of_source ~visibility:Visibility.Public ~kind source in
+    let module_config = { module_; opens = []; reader = None } in
+    let pp_config = Module_name.Per_item.for_all None in
+    let per_file_config =
+      [ file, module_config; remove_extension file, module_config ]
+      |> Path.Build.Map.of_list_reduce ~f:(fun existing _ -> existing)
+    in
+    get { config; per_file_config; pp_config } ~file
   ;;
 
   let dump_entries { per_file_config; pp_config; config } : Dump_entry.t list =

@@ -165,36 +165,41 @@ end = struct
     loop (Path.Build.parent_exn file)
   ;;
 
-  let load_external_package_config ~selected_context ~context file =
+  let load_external_package_config ~selected_context ~context file ~physical_file =
     let base =
       match context with
       | Some context -> load_context_merlin_config context
       | None -> load_selected_context_merlin_config selected_context
     in
-    match find_nearest_dune_package file with
-    | None -> Fiber.return None
-    | Some dune_package_path ->
-      let package =
-        Io.with_lexbuf_from_file dune_package_path ~f:(fun lexbuf ->
-          Dune_rules.Dune_package.Or_meta.parse dune_package_path lexbuf)
-      in
-      Fiber.return
+    let config =
+      match find_nearest_dune_package file with
+      | None -> None
+      | Some dune_package_path ->
+        let package =
+          Io.with_lexbuf_from_file dune_package_path ~f:(fun lexbuf ->
+            Dune_rules.Dune_package.Or_meta.parse dune_package_path lexbuf)
+        in
         (match package with
          | Error _ | Ok Dune_rules.Dune_package.Or_meta.Use_meta -> None
          | Ok (Dune_rules.Dune_package.Or_meta.Dune_package package) ->
            Merlin.Processed.get_external_package ~base package ~file)
+    in
+    Fiber.return
+      (match config with
+       | Some _ as config -> config
+       | None -> Merlin.Processed.get_external_source_fallback ~base ~file ~physical_file)
   ;;
 
-  let load_merlin_file ~selected_context ~context file =
+  let load_merlin_file ~selected_context ~context file ~physical_file =
     match find_closest_processed (Path.Build.parent_exn file) with
     | Some config ->
       (match Merlin.Processed.get config ~file with
        | Some config -> Fiber.return config
        | None ->
-         load_external_package_config ~selected_context ~context file
+         load_external_package_config ~selected_context ~context file ~physical_file
          >>| Option.value ~default:(no_config_found file))
     | None ->
-      load_external_package_config ~selected_context ~context file
+      load_external_package_config ~selected_context ~context file ~physical_file
       >>| Option.value ~default:(no_config_found file)
   ;;
 
@@ -265,6 +270,12 @@ end = struct
 
   let print_merlin_conf ~selected_context ~path ~context =
     let open Fiber.O in
+    let physical_file =
+      let path = Path.of_filename_relative_to_initial_cwd path in
+      match Path.as_outside_build_dir path with
+      | Some (External _) -> Some path
+      | Some (In_source_dir _) | None -> None
+    in
     let* context =
       match context with
       | None -> Fiber.return None
@@ -278,7 +289,7 @@ end = struct
       to_local ~selected_context path
       >>= function
       | Error s -> Fiber.return (Merlin_conf.make_error s)
-      | Ok file -> load_merlin_file ~selected_context ~context file
+      | Ok file -> load_merlin_file ~selected_context ~context file ~physical_file
     in
     Fiber.return (Merlin_conf.to_stdout config)
   ;;

@@ -9,15 +9,16 @@ provided for the same real external path.
   > (package
   >  (name smoke-dep))
   > EOF
-  $ cat > external_sources/dune <<EOF
+  $ mkdir -p external_sources/src
+  $ cat > external_sources/src/dune <<EOF
   > (library
   >  (name smoke_dep)
   >  (public_name smoke-dep))
   > EOF
-  $ cat > external_sources/smoke_dep.mli <<EOF
+  $ cat > external_sources/src/smoke_dep.mli <<EOF
   > val message : string
   > EOF
-  $ cat > external_sources/smoke_dep.ml <<EOF
+  $ cat > external_sources/src/smoke_dep.ml <<EOF
   > let message = "from dependency"
   > EOF
 
@@ -59,12 +60,11 @@ provided for the same real external path.
   $ dune build @check
 
 The real external source file should remain queryable as-is.
-  $ FILE=$EXTROOT/smoke_dep.ml
+  $ FILE=$EXTROOT/src/smoke_dep.ml
   $ printf "(4:File%d:%s)" ${#FILE} $FILE | dune ocaml-merlin |
   > sed -E "s/[[:digit:]]+:/?:/g" | sed "s#$PWD#\$PWD#g" |
   > sed "s#$EXTROOT#\$EXTROOT#g" | tr '(' '\n' |
-  > grep -E '(\?:S\?:\$EXTROOT\)|\?:UNIT_NAME\?:smoke_dep\))'
-  ?:S?:$EXTROOT)
+  > grep -E '\?:UNIT_NAME\?:smoke_dep\)'
   ?:UNIT_NAME?:smoke_dep))
 
 The same real external path should also accept explicit origin context.
@@ -73,6 +73,24 @@ The same real external path should also accept explicit origin context.
   > | dune ocaml-merlin \
   > | sed -E "s/[[:digit:]]+:/?:/g" | sed "s#$PWD#\$PWD#g" |
   > sed "s#$EXTROOT#\$EXTROOT#g" | tr '(' '\n' |
-  > grep -E '(\?:S\?:\$EXTROOT\)|\?:UNIT_NAME\?:smoke_dep\))'
-  ?:S?:$EXTROOT)
+  > grep -E '\?:UNIT_NAME\?:smoke_dep\)'
+  ?:UNIT_NAME?:smoke_dep))
+
+The materialized package source inside `_build/_private/.../source/...` should
+also remain queryable.
+  $ FILE=$(find $PWD/_build/_private/default/.pkg -path '*/source/src/smoke_dep.ml' | head -n 1)
+  $ printf "(4:File%d:%s)" ${#FILE} $FILE | dune ocaml-merlin |
+  > sed -E "s/[[:digit:]]+:/?:/g" | sed "s#$PWD#\$PWD#g" |
+  > tr '(' '\n' |
+  > grep -E '\?:UNIT_NAME\?:smoke_dep\)'
+  ?:UNIT_NAME?:smoke_dep))
+
+The built package file inside `_build/_private/.../target/lib/...` should also
+remain queryable when an origin context is provided.
+  $ FILE=$(find $PWD/_build/_private/default/.pkg -path '*/target/lib/smoke-dep/smoke_dep.ml' -o -path '*/target/lib/smoke_dep/smoke_dep.ml' | head -n 1)
+  $ printf "(4:File%d:%s7:Context%d:%s)" ${#FILE} $FILE ${#MAIN} $MAIN \
+  > | dune ocaml-merlin \
+  > | sed -E "s/[[:digit:]]+:/?:/g" | sed "s#$PWD#\$PWD#g" |
+  > tr '(' '\n' |
+  > grep -E '\?:UNIT_NAME\?:smoke_dep\)'
   ?:UNIT_NAME?:smoke_dep))

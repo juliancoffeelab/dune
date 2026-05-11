@@ -51,6 +51,12 @@ module Processed : sig
     -> Dune_package.t
     -> file:Path.Build.t
     -> Sexp.t option
+
+  val get_external_source_fallback
+    :  base:t option
+    -> file:Path.Build.t
+    -> physical_file:Path.t option
+    -> Sexp.t option
 end
 
 val make
